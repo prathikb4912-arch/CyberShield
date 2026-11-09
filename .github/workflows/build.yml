@@ -1,0 +1,192 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          mkdir -p src/main/java/com/cybershield/app
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "CyberShield"
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2"
+              id("org.jetbrains.kotlin.android") version "1.9.24"
+          }
+          android {
+              namespace = "com.cybershield.app"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.cybershield.app"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "0.1"
+              }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          cat > src/main/AndroidManifest.xml <<'EOF_FILE'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET"/>
+            <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+            <application android:label="CyberShield" android:theme="@android:style/Theme.Material">
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+              <service android:name=".ShieldCallScreening" android:exported="true"
+                  android:permission="android.permission.BIND_SCREENING_SERVICE">
+                <intent-filter><action android:name="android.telecom.CallScreeningService"/></intent-filter>
+              </service>
+              <service android:name=".MessageWatcher" android:exported="true"
+                  android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                <intent-filter><action android:name="android.service.notification.NotificationListenerService"/></intent-filter>
+              </service>
+            </application>
+          </manifest>
+          EOF_FILE
+          cat > src/main/java/com/cybershield/app/MainActivity.kt <<'EOF_FILE'
+          package com.cybershield.app
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.role.RoleManager
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+          import android.telecom.Call
+          import android.telecom.CallScreeningService
+          import android.widget.*
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLEncoder
+          import kotlin.concurrent.thread
+
+          /** On-device scam wording rules. Message text never leaves the phone. */
+          object ScamRules {
+              data class Result(val level: String, val reasons: List<String>)
+              private val I = RegexOption.IGNORE_CASE
+              private val rules = listOf(
+                  Triple(Regex("\\b(urgent|immediately|act now|final notice|expires? today)\\b", I), 2, "Urgency pressure"),
+                  Triple(Regex("\\b(otp|one[- ]time (password|code)|pin|cvv|password)\\b", I), 3, "Asks for a secret code"),
+                  Triple(Regex("\\b(kyc|account (is |will be )?(suspended|blocked|locked)|verify your (account|identity))\\b", I), 3, "Account threat"),
+                  Triple(Regex("\\b(you (have )?won|lottery|prize|claim your (reward|gift))\\b", I), 3, "Prize claim"),
+                  Triple(Regex("\\b(gift ?cards?|bitcoin|crypto|wire transfer|processing fee)\\b", I), 3, "Unusual payment"),
+                  Triple(Regex("\\b(click (here|the link)|bit\\.ly|tinyurl\\.com|cutt\\.ly)\\S*", I), 2, "Suspicious link prompt"),
+                  Triple(Regex("\\b(arrest|legal action|parcel (is )?held|delivery (failed|fee))\\b", I), 2, "Threat or pretext")
+              )
+              fun analyse(text: String): Result {
+                  var score = 0; val why = mutableListOf<String>()
+                  for ((re, w, name) in rules) if (re.containsMatchIn(text)) { score += w; why += name }
+                  return Result(if (score >= 6) "HIGH" else if (score >= 3) "MEDIUM" else "LOW", why)
+              }
+          }
+
+          object Api {
+              /** Your deployed backend (HTTPS). Leave blank to use on-device rules only; number lookups then say "not connected". */
+              const val BASE_URL = ""
+
+              fun reportCount(number: String): Int? {
+                  if (BASE_URL.isBlank()) return null
+                  return try {
+                      val c = URL("$BASE_URL/api/number?n=" + URLEncoder.encode(number, "UTF-8")).openConnection() as HttpURLConnection
+                      c.connectTimeout = 2500; c.readTimeout = 2500
+                      if (c.responseCode != 200) null else JSONObject(c.inputStream.bufferedReader().readText()).getInt("reports")
+                  } catch (e: Exception) { null }
+              }
+
+              fun warn(ctx: Context, title: String, body: String, id: Int) {
+                  val nm = ctx.getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("shield", "Scam warnings", NotificationManager.IMPORTANCE_HIGH))
+                  nm.notify(id, Notification.Builder(ctx, "shield").setSmallIcon(android.R.drawable.ic_dialog_alert)
+                      .setContentTitle(title).setContentText(body).setStyle(Notification.BigTextStyle().bigText(body)).build())
+              }
+          }
+
+          /** Caller warnings: flags numbers reported by CyberShield users. Allows the call; never blocks. */
+          class ShieldCallScreening : CallScreeningService() {
+              override fun onScreenCall(details: Call.Details) {
+                  val number = details.handle?.schemeSpecificPart.orEmpty()
+                  thread {
+                      val n = if (number.isNotBlank()) Api.reportCount(number) else null
+                      if (n != null && n > 0)
+                          Api.warn(this, "Possible scam call", "$number was reported $n time(s) by CyberShield users.", number.hashCode())
+                      respondToCall(details, CallResponse.Builder().build())
+                  }
+              }
+          }
+
+          /** Real-time message scan: reads SMS/WhatsApp notification text on-device and warns on risky wording. */
+          class MessageWatcher : NotificationListenerService() {
+              private val watched = setOf("com.google.android.apps.messaging", "com.samsung.android.messaging", "com.whatsapp")
+              override fun onNotificationPosted(sbn: StatusBarNotification) {
+                  if (sbn.packageName !in watched) return
+                  val text = sbn.notification.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: return
+                  val r = ScamRules.analyse(text)
+                  if (r.level != "LOW")
+                      Api.warn(this, "Possible scam message (${r.level})", r.reasons.joinToString(", ") + ". Do not click links or share codes.", sbn.id)
+              }
+          }
+
+          class MainActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 0)
+                  val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 100, 40, 40) }
+                  fun btn(t: String, f: () -> Unit) = Button(this).apply { text = t; setOnClickListener { f() } }.also(box::addView)
+                  box.addView(TextView(this).apply { text = "CyberShield\nDetect Threats. Protect People."; textSize = 20f })
+                  btn("Enable caller warnings") {
+                      startActivityForResult(getSystemService(RoleManager::class.java).createRequestRoleIntent(RoleManager.ROLE_CALL_SCREENING), 1)
+                  }
+                  btn("Enable message scanning") { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }
+                  val msg = EditText(this).apply { hint = "Paste a suspicious message"; minLines = 3 }.also(box::addView)
+                  val out = TextView(this).also(box::addView)
+                  btn("Analyse message") {
+                      val r = ScamRules.analyse(msg.text.toString())
+                      out.text = "Risk: ${r.level}\n" + r.reasons.joinToString("\n") + "\n\nLOW does not mean safe."
+                  }
+                  val num = EditText(this).apply { hint = "Phone number" }.also(box::addView)
+                  btn("Check number") {
+                      thread {
+                          val n = Api.reportCount(num.text.toString())
+                          runOnUiThread { out.text = when {
+                              n == null -> "No backend connected, so reports cannot be checked."
+                              n == 0 -> "No community reports. This does not prove the number is safe."
+                              else -> "Reported $n time(s) by users." } }
+                      }
+                  }
+                  setContentView(ScrollView(this).apply { addView(box) })
+              }
+          }
+          EOF_FILE
+
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cybershield-apk
+          path: build/outputs/apk/debug/*.apk
